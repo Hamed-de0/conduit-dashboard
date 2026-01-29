@@ -1,0 +1,42 @@
+# Sensitive configuration files
+conduit-vps.conf
+
+# Runtime data
+conduit-history.json
+*.log
+
+# Temporary files
+vps*.txt
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup

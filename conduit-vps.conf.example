@@ -1,0 +1,12 @@
+# conduit-vps.conf
+# Format: alias|user|ip|port|password|comment
+# Password: use actual password OR "-" for SSH key auth
+# Lines starting with # are ignored
+
+# Examples with password:
+# vps1|root|1.2.3.4|22|mySecretPass123|VPS with password auth
+# vps2|root|1.2.3.4|22|mySecretPass123|VPS with password auth
+# vps3|root|1.2.3.4|22|mySecretPass123|VPS with password auth
+
+#IONOS VPS XXL - Berlin
+# vps3|root|another.ip.goes.here|22|-|Future VPS 3

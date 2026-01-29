@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conduit VPS Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        
+        .dashboard {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(90deg, #00d9ff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+        }
+        
+        .timestamp {
+            color: #888;
+            font-size: 0.9rem;
+        }
+        
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        
+        .summary-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 24px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .summary-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 40px rgba(0, 217, 255, 0.2);
+        }
+        
+        .summary-icon {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+        
+        .summary-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #00d9ff;
+        }
+        
+        .summary-label {
+            color: #888;
+            font-size: 0.9rem;
+            margin-top: 5px;
+        }
+        
+        .vps-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+            gap: 24px;
+        }
+        
+        .vps-card {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 16px;
+            padding: 24px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
+        }
+        
+        .vps-card:hover {
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(0, 217, 255, 0.3);
+        }
+        
+        .vps-card.status-online {
+            border-left: 4px solid #00ff88;
+        }
+        
+        .vps-card.status-warning {
+            border-left: 4px solid #ffaa00;
+        }
+        
+        .vps-card.status-offline {
+            border-left: 4px solid #ff4444;
+        }
+        
+        .vps-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .vps-name {
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: #fff;
+        }
+        
+        .vps-status {
+            font-size: 0.85rem;
+            padding: 4px 12px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .vps-ip {
+            font-family: 'Monaco', 'Menlo', monospace;
+            color: #00d9ff;
+            font-size: 0.9rem;
+            margin-bottom: 4px;
+        }
+        
+        .vps-comment {
+            color: #666;
+            font-size: 0.85rem;
+            margin-bottom: 20px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-item {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 12px;
+            border-radius: 10px;
+        }
+        
+        .stat-label {
+            font-size: 0.75rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .stat-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #fff;
+            margin: 4px 0;
+        }
+        
+        .progress-bar {
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.5s ease;
+        }
+        
+        .progress-fill.cpu {
+            background: linear-gradient(90deg, #00ff88, #00d9ff);
+        }
+        
+        .progress-fill.memory {
+            background: linear-gradient(90deg, #ff6b6b, #ffa502);
+        }
+        
+        .vps-footer {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: #666;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        .refresh-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, #00d9ff, #00ff88);
+            color: #1a1a2e;
+            border: none;
+            padding: 16px 24px;
+            border-radius: 50px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 4px 20px rgba(0, 217, 255, 0.4);
+            transition: all 0.3s;
+        }
+        
+        .refresh-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 30px rgba(0, 217, 255, 0.6);
+        }
+        
+        @media (max-width: 768px) {
+            h1 { font-size: 1.8rem; }
+            .vps-grid { grid-template-columns: 1fr; }
+            .summary-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <header>
+            <h1>🚀 Conduit VPS Dashboard</h1>
+            <p class="timestamp">Last updated: 2026-01-28 18:15:59</p>
+        </header>
+        
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="summary-icon">🖥️</div>
+                <div class="summary-value">2/2</div>
+                <div class="summary-label">VPS Online</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-icon">🐳</div>
+                <div class="summary-value">2</div>
+                <div class="summary-label">Containers Running</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-icon">⚡</div>
+                <div class="summary-value">301.7%</div>
+                <div class="summary-label">Avg CPU Usage</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-icon">💾</div>
+                <div class="summary-value">333 MB</div>
+                <div class="summary-label">Total Memory</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-icon">📥</div>
+                <div class="summary-value">0.00 GB</div>
+                <div class="summary-label">Total Download</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-icon">📤</div>
+                <div class="summary-value">0.00 GB</div>
+                <div class="summary-label">Total Upload</div>
+            </div>
+        </div>
+        
+        <div class="vps-grid">
+            
+        <div class="vps-card status-online">
+            <div class="vps-header">
+                <span class="vps-name">vps1</span>
+                <span class="vps-status">🟢 Running</span>
+            </div>
+            <div class="vps-ip">82.165.40.61</div>
+            <div class="vps-comment">First VPS1</div>
+            
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="stat-label">CPU</div>
+                    <div class="stat-value">255.2%</div>
+                    <div class="progress-bar"><div class="progress-fill cpu" style="width: 100%"></div></div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Memory</div>
+                    <div class="stat-value">194 MB</div>
+                    <div class="progress-bar"><div class="progress-fill memory" style="width: 0%"></div></div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Network ↓</div>
+                    <div class="stat-value">0.0 MB</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Network ↑</div>
+                    <div class="stat-value">0.0 MB</div>
+                </div>
+            </div>
+            
+            <div class="vps-footer">
+                <span>Uptime: 3 hours, 35 minutes</span>
+                <span>OCI runtime exec failed: exec failed: unable to start container process: exec: "/conduit": stat /conduit: no such file or directory</span>
+            </div>
+        </div>
+        
+        <div class="vps-card status-online">
+            <div class="vps-header">
+                <span class="vps-name">vps2</span>
+                <span class="vps-status">🟢 Running</span>
+            </div>
+            <div class="vps-ip">82.165.40.143</div>
+            <div class="vps-comment">Second VPS2</div>
+            
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="stat-label">CPU</div>
+                    <div class="stat-value">348.2%</div>
+                    <div class="progress-bar"><div class="progress-fill cpu" style="width: 100%"></div></div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Memory</div>
+                    <div class="stat-value">139 MB</div>
+                    <div class="progress-bar"><div class="progress-fill memory" style="width: 0%"></div></div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Network ↓</div>
+                    <div class="stat-value">0.0 MB</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Network ↑</div>
+                    <div class="stat-value">0.0 MB</div>
+                </div>
+            </div>
+            
+            <div class="vps-footer">
+                <span>Uptime: 59 minutes</span>
+                <span>OCI runtime exec failed: exec failed: unable to start container process: exec: "/conduit": stat /conduit: no such file or directory: unknown</span>
+            </div>
+        </div>
+        
+        </div>
+    </div>
+    
+    <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+</body>
+</html>
