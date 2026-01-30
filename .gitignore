@@ -40,3 +40,13 @@ Thumbs.db
 # Backup files
 *.bak
 *.backup
+all-vless-links.txt
+
+# Deployment scripts with credentials
+deploy-all-vps.sh
+deploy-vless.sh
+setup-vless.sh
+generate-all-links.py
+add_vless.py
+vless-dashboard.py
+generate_vless_configs.py
