@@ -19,8 +19,10 @@ SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "conduit-vps.conf"
 HISTORY_FILE = SCRIPT_DIR / "conduit-history.json"
 PORT = 5050
-REFRESH_INTERVAL = 10  # seconds
+REFRESH_INTERVAL = 15  # seconds
+SSH_TIMEOUT = 15 # seconds
 HISTORY_DAYS = 2  # Keep 2 days of history
+
 
 # Service names we track
 SERVICES = ["conduit", "snowflake", "tor-bridge"]
@@ -29,6 +31,14 @@ SERVICES = ["conduit", "snowflake", "tor-bridge"]
 current_stats = {"vps": [], "timestamp": ""}
 stats_lock = threading.Lock()
 
+# Docker execution strategy cache per VPS:
+# "" (plain docker) or "sudo -n " or "echo 'pass' | sudo -S -p '' "
+docker_prefix_cache = {}
+docker_prefix_lock = threading.Lock()
+
+# VPS static hardware cache per VPS (cores, total RAM in MB)
+vps_hw_cache = {}
+vps_hw_lock = threading.Lock()
 
 def load_history():
     """Load connection history from JSON file."""
@@ -86,11 +96,103 @@ def ssh_command(vps, cmd):
         full_cmd = f"ssh {ssh_opts} -p {vps['port']} {vps['user']}@{vps['ip']} \"{cmd}\""
     
     try:
-        result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=SSH_TIMEOUT)
         return result.stdout.strip()
     except:
         return None
 
+def _sh_single_quote(s: str) -> str:
+    """Safely single-quote a string for /bin/sh."""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def get_docker_prefix(vps):
+    """
+    Decide how to run docker on this VPS:
+    1) docker ...
+    2) sudo -n docker ...
+    3) echo <pass> | sudo -S -p '' docker ...
+    Cached per VPS so we probe only once.
+    """
+    key = f"{vps.get('user')}@{vps.get('ip')}:{vps.get('port')}"
+    with docker_prefix_lock:
+        if key in docker_prefix_cache:
+            return docker_prefix_cache[key]
+
+    # 1) plain docker
+    probe = ssh_command(vps, "docker info >/dev/null 2>&1 && echo OK || echo FAIL")
+    if probe and probe.strip() == "OK":
+        prefix = ""
+    else:
+        # 2) passwordless sudo (non-interactive)
+        probe2 = ssh_command(vps, "sudo -n docker info >/dev/null 2>&1 && echo OK || echo FAIL")
+        if probe2 and probe2.strip() == "OK":
+            prefix = "sudo -n "
+        else:
+            # 3) sudo with password over stdin (only if we have a password in config)
+            prefix = ""
+            if vps.get("password") and vps["password"] != "-":
+                pw = _sh_single_quote(vps["password"])
+                probe3 = ssh_command(
+                    vps,
+                    f"echo {pw} | sudo -S -p '' docker info >/dev/null 2>&1 && echo OK || echo FAIL"
+                )
+                if probe3 and probe3.strip() == "OK":
+                    prefix = f"echo {pw} | sudo -S -p '' "
+
+    with docker_prefix_lock:
+        docker_prefix_cache[key] = prefix
+    return prefix
+
+
+def docker_command(vps, docker_args):
+    """Run a docker command on VPS using the discovered strategy."""
+    prefix = get_docker_prefix(vps)
+    return ssh_command(vps, f"{prefix}docker {docker_args}")
+
+def _vps_key(vps) -> str:
+    """Stable cache key for a VPS."""
+    return f"{vps.get('user')}@{vps.get('ip')}:{vps.get('port')}"
+
+def get_vps_hardware(vps):
+    """
+    Get VPS static hardware info once (per VPS) and cache it:
+      - cpu_cores (int)
+      - mem_total_mb (float)
+    """
+    key = _vps_key(vps)
+    with vps_hw_lock:
+        if key in vps_hw_cache:
+            return vps_hw_cache[key]["cpu_cores"], vps_hw_cache[key]["mem_total_mb"]
+
+    # CPU cores
+    cores_out = ssh_command(
+        vps,
+        "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null"
+    )
+    try:
+        cpu_cores = int((cores_out or "").strip())
+        if cpu_cores <= 0:
+            cpu_cores = 1
+    except:
+        cpu_cores = 1
+
+    # Total RAM (kB from /proc/meminfo)
+    mem_kb_out = ssh_command(vps, "grep -i '^MemTotal:' /proc/meminfo 2>/dev/null | awk '{print $2}'")
+    try:
+        s = (mem_kb_out or "").strip()
+        m = re.search(r'(\d+(?:\.\d+)?)', s)
+        mem_total_kb = float(m.group(1)) if m else 0.0
+        mem_total_mb = mem_total_kb / 1024.0
+        if mem_total_mb <= 0:
+            mem_total_mb = 0.0
+    except:
+        mem_total_mb = 0.0
+
+    with vps_hw_lock:
+        vps_hw_cache[key] = {"cpu_cores": cpu_cores, "mem_total_mb": mem_total_mb}
+
+    return cpu_cores, mem_total_mb
 
 def get_vps_stats(vps):
     """Collect all stats from a single VPS."""
@@ -130,10 +232,17 @@ def get_vps_stats(vps):
     
     stats["online"] = True
     stats["uptime"] = uptime.replace("up ", "")
-    
+
+    # Static hardware info (cached once per VPS)
+    cpu_cores, mem_total_mb = get_vps_hardware(vps)
+    # Optional: keep these in stats for debugging/visibility (UI can ignore them safely)
+    stats["cpu_cores"] = cpu_cores
+    stats["memory_total_mb"] = mem_total_mb
+
     # Check all container statuses in one command
-    container_info = ssh_command(vps, 
-        "docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null"
+    container_info = docker_command(
+        vps,
+        "ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null"
     )
     
     if container_info:
@@ -162,7 +271,7 @@ def get_vps_stats(vps):
     
     # Get Conduit connection count from [STATS] log line
     if stats["conduit_running"]:
-        stats_line = ssh_command(vps, "docker logs conduit 2>&1 | grep '\\[STATS\\]' | tail -1")
+        stats_line = docker_command(vps, "logs conduit 2>&1 | grep '\\[STATS\\]' | tail -1")
         if stats_line:
             # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
             
@@ -206,8 +315,9 @@ def get_vps_stats(vps):
     
     # Get Snowflake client count from logs
     if stats["snowflake_running"]:
-        snowflake_log = ssh_command(vps, 
-            "docker logs snowflake 2>&1 | grep -c 'client connected' 2>/dev/null || echo 0"
+        snowflake_log = docker_command(
+            vps,
+            "logs snowflake 2>&1 | grep -c 'client connected' 2>/dev/null || echo 0"
         )
         if snowflake_log:
             try:
@@ -217,36 +327,57 @@ def get_vps_stats(vps):
     
     # Get Tor Bridge bootstrap status
     if stats["torbridge_running"]:
-        tor_log = ssh_command(vps, 
-            "docker logs tor-bridge 2>&1 | grep -i 'bootstrap' | tail -1"
-        )
+        tor_log = docker_command(vps, "logs tor-bridge 2>&1 | grep -i 'bootstrap' | tail -1")
+
         if tor_log:
             bootstrap_match = re.search(r'Bootstrapped (\d+)%', tor_log)
             if bootstrap_match:
                 stats["torbridge_bootstrap"] = int(bootstrap_match.group(1))
     
     # Get docker stats for CPU/Memory
-    docker_stats = ssh_command(vps, 
-        "docker stats conduit --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' 2>/dev/null"
+    docker_stats = docker_command(
+        vps,
+        "stats conduit --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' 2>/dev/null"
     )
+
     if docker_stats:
         parts = docker_stats.split("|")
         if len(parts) >= 2:
+            # CPU: normalize Docker CPU% to 0-100 by dividing by VPS core count
             try:
-                stats["cpu_percent"] = float(parts[0].replace("%", "").strip())
+                raw_cpu = float(parts[0].replace("%", "").strip())
+                cores = stats.get("cpu_cores") or 1
+                stats["cpu_percent"] = raw_cpu / float(cores) if cores else raw_cpu
+                if stats["cpu_percent"] < 0:
+                    stats["cpu_percent"] = 0
             except:
                 pass
-            
-            mem_match = re.search(r'([\d.]+)(MiB|GiB|MB|GB)', parts[1])
+
+            # Memory: take container used memory, compute % of total VPS RAM
+            # docker MemUsage usually looks like: "238MiB / 7.57GiB"
+            mem_match = re.search(r'([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB)', parts[1])
             if mem_match:
                 mem_val = float(mem_match.group(1))
-                if mem_match.group(2) in ("GiB", "GB"):
-                    mem_val *= 1024
-                stats["memory_mb"] = round(mem_val, 1)
-            
-            mem_pct_match = re.search(r'([\d.]+)%', parts[1])
-            if mem_pct_match:
-                stats["memory_percent"] = float(mem_pct_match.group(1))
+                unit = mem_match.group(2)
+
+                # Convert to MB
+                if unit in ("KiB", "KB"):
+                    used_mb = mem_val / 1024.0
+                elif unit in ("GiB", "GB"):
+                    used_mb = mem_val * 1024.0
+                else:
+                    used_mb = mem_val  # MiB or MB
+
+                stats["memory_mb"] = round(used_mb, 1)
+
+                total_mb = float(stats.get("memory_total_mb") or 0.0)
+                if total_mb > 0:
+                    pct = (used_mb / total_mb) * 100.0
+                    if pct < 0:
+                        pct = 0.0
+                    if pct > 100:
+                        pct = 100.0
+                    stats["memory_percent"] = pct
     
     return stats
 
@@ -300,7 +431,7 @@ def stats_collector_loop():
         time.sleep(REFRESH_INTERVAL)
 
 
-HTML_TEMPLATE = '''<!DOCTYPE html>
+HTML_TEMPLATE = '''<!DOCTYPE html>ش
 <html lang="en">
 <head>
     <meta charset="UTF-8">
