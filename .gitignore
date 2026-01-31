@@ -50,3 +50,4 @@ generate-all-links.py
 add_vless.py
 vless-dashboard.py
 generate_vless_configs.py
+links-config.txt
