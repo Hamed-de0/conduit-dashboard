@@ -10,7 +10,6 @@ import re
 import json
 import threading
 import time
-import base64
 from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,11 +19,16 @@ SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "conduit-vps.conf"
 HISTORY_FILE = SCRIPT_DIR / "conduit-history.json"
 PORT = 5050
-REFRESH_INTERVAL = 15  # seconds
-SSH_TIMEOUT = 15 # seconds
-SSH_CONNECT_TIMEOUT = 10
-SSH_Server_Alive_Interval = 30
 HISTORY_DAYS = 2  # Keep 2 days of history
+REFRESH_INTERVAL = 15  # seconds
+
+SSH_TIMEOUT = 240  # seconds
+SSH_CONNECT_TIMEOUT = 120 # seconds
+SSH_SERVER_ALIVE_INTERVAL = 180 # seconds
+SSH_SERVER_ALIVE_COUNTMAX = 7
+
+MASK_IP_ACTIVATED = True
+MAX_WORKERS = 5
 
 # Service names we track
 SERVICES = ["conduit", "conduit2", "snowflake", "tor-bridge"]
@@ -41,6 +45,7 @@ docker_prefix_lock = threading.Lock()
 # VPS static hardware cache per VPS (cores, total RAM in MB)
 vps_hw_cache = {}
 vps_hw_lock = threading.Lock()
+
 
 def load_history():
     """Load connection history from JSON file."""
@@ -87,19 +92,15 @@ def parse_config():
                 })
     return vps_list
 
-
-def mask_ip(ip):
-    """Mask IP address for public display (e.g., 82.165.40.61 -> 82.165.***.***)"""
-    parts = ip.split('.')
-    if len(parts) == 4:
-        return f"{parts[0]}.{parts[1]}.***.***"
-    return "***.***.***.***"
-
-
 def ssh_command(vps, cmd):
     """Execute SSH command on VPS."""
-    ssh_opts = f"-o StrictHostKeyChecking=no -o ConnectTimeout={SSH_CONNECT_TIMEOUT} -o ServerAliveInterval={SSH_Server_Alive_Interval}"
-    
+    ssh_opts = (
+        f"-o StrictHostKeyChecking=no "
+        f"-o ConnectTimeout={SSH_CONNECT_TIMEOUT} "
+        f"-o ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL} "
+        f"-o ServerAliveCountMax={SSH_SERVER_ALIVE_COUNTMAX}"
+    )
+
     if vps["password"] and vps["password"] != "-":
         full_cmd = f"sshpass -p '{vps['password']}' ssh {ssh_opts} -p {vps['port']} {vps['user']}@{vps['ip']} \"{cmd}\""
     else:
@@ -107,12 +108,13 @@ def ssh_command(vps, cmd):
 
     if vps["ip"] in ("127.0.0.1", "LOCAL", "Local", "local"):
         full_cmd = cmd
-    
+
     try:
         result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=SSH_TIMEOUT)
         return result.stdout.strip()
     except:
         return None
+
 
 def _sh_single_quote(s: str) -> str:
     """Safely single-quote a string for /bin/sh."""
@@ -163,9 +165,11 @@ def docker_command(vps, docker_args):
     prefix = get_docker_prefix(vps)
     return ssh_command(vps, f"{prefix}docker {docker_args}")
 
+
 def _vps_key(vps) -> str:
     """Stable cache key for a VPS."""
     return f"{vps.get('user')}@{vps.get('ip')}:{vps.get('port')}"
+
 
 def get_vps_hardware(vps):
     """
@@ -207,6 +211,7 @@ def get_vps_hardware(vps):
 
     return cpu_cores, mem_total_mb
 
+
 def get_vps_stats(vps):
     """Collect all stats from a single VPS."""
     stats = {
@@ -217,8 +222,8 @@ def get_vps_stats(vps):
         # Conduit 1 stats
         "conduit_running": False,
         "conduit_uptime": "N/A",
-        "connections": 0,
-        "connecting": 0,
+        "connections": None,
+        "connecting": None,
         "conduit_up": "N/A",
         "conduit_down": "N/A",
         "conduit_up_gb": 0,
@@ -226,8 +231,8 @@ def get_vps_stats(vps):
         # Conduit 2 stats
         "conduit2_running": False,
         "conduit2_uptime": "N/A",
-        "connections2": 0,
-        "connecting2": 0,
+        "connections2": None,
+        "connecting2": None,
         "conduit2_up": "N/A",
         "conduit2_down": "N/A",
         "conduit2_up_gb": 0,
@@ -235,7 +240,7 @@ def get_vps_stats(vps):
         # Snowflake stats
         "snowflake_running": False,
         "snowflake_uptime": "N/A",
-        "snowflake_clients": 0,
+        "snowflake_clients": None,
         # Tor Bridge stats
         "torbridge_running": False,
         "torbridge_uptime": "N/A",
@@ -246,12 +251,12 @@ def get_vps_stats(vps):
         "memory_percent": 0,
         "uptime": "N/A",
     }
-    
+
     # Check if online
     uptime = ssh_command(vps, "uptime -p 2>/dev/null || uptime | awk '{print $3,$4}'")
     if uptime is None:
         return stats
-    
+
     stats["online"] = True
     stats["uptime"] = uptime.replace("up ", "")
 
@@ -266,21 +271,21 @@ def get_vps_stats(vps):
         vps,
         "ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null"
     )
-    
+
     if container_info:
         for line in container_info.split('\n'):
             if '|' not in line:
                 continue
             name, status = line.split('|', 1)
             is_up = status.startswith('Up')
-            
+
             # Parse uptime from status like "Up 3 hours" or "Up 2 days"
             uptime_str = "N/A"
             if is_up:
                 uptime_match = re.search(r'Up\s+(.+?)(?:\s+\(|$)', status)
                 if uptime_match:
                     uptime_str = uptime_match.group(1).strip()
-            
+
             if name == "conduit":
                 stats["conduit_running"] = is_up
                 stats["conduit_uptime"] = uptime_str
@@ -293,21 +298,21 @@ def get_vps_stats(vps):
             elif name == "tor-bridge":
                 stats["torbridge_running"] = is_up
                 stats["torbridge_uptime"] = uptime_str
-    
+
     # Get Conduit connection count from [STATS] log line
     if stats["conduit_running"]:
-        stats_line = docker_command(vps, "logs conduit 2>&1 | grep '\\[STATS\\]' | tail -1")
+        stats_line = docker_command(vps, "logs --since 10m --tail 100 conduit | grep '\[STATS\]' | tail -1")
         if stats_line:
             # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
-            
+
             connecting_match = re.search(r'Connecting:\s*(\d+)', stats_line)
             if connecting_match:
                 stats["connecting"] = int(connecting_match.group(1))
-            
+
             connected_match = re.search(r'Connected:\s*(\d+)', stats_line)
             if connected_match:
                 stats["connections"] = int(connected_match.group(1))
-            
+
             up_match = re.search(r'Up:\s*([\d.]+)\s*(GB|MB|KB)', stats_line)
             if up_match:
                 val = float(up_match.group(1))
@@ -322,7 +327,7 @@ def get_vps_stats(vps):
                 else:
                     stats["conduit_up_gb"] = val
                     stats["conduit_up"] = f"{val:.1f} GB"
-            
+
             down_match = re.search(r'Down:\s*([\d.]+)\s*(GB|MB|KB)', stats_line)
             if down_match:
                 val = float(down_match.group(1))
@@ -337,19 +342,19 @@ def get_vps_stats(vps):
                 else:
                     stats["conduit_down_gb"] = val
                     stats["conduit_down"] = f"{val:.1f} GB"
-    
+
     # Get Conduit2 connection count from [STATS] log line
     if stats["conduit2_running"]:
-        stats_line2 = docker_command(vps, "logs conduit2 2>&1 | grep '\\[STATS\\]' | tail -1")
+        stats_line2 = docker_command(vps, "logs --since 10m --tail 100 conduit | grep '\[STATS\]' | tail -1")
         if stats_line2:
             connecting_match2 = re.search(r'Connecting:\s*(\d+)', stats_line2)
             if connecting_match2:
                 stats["connecting2"] = int(connecting_match2.group(1))
-            
+
             connected_match2 = re.search(r'Connected:\s*(\d+)', stats_line2)
             if connected_match2:
                 stats["connections2"] = int(connected_match2.group(1))
-            
+
             up_match2 = re.search(r'Up:\s*([\d.]+)\s*(GB|MB|KB)', stats_line2)
             if up_match2:
                 val = float(up_match2.group(1))
@@ -363,7 +368,7 @@ def get_vps_stats(vps):
                 else:
                     stats["conduit2_up_gb"] = val
                     stats["conduit2_up"] = f"{val:.1f} GB"
-            
+
             down_match2 = re.search(r'Down:\s*([\d.]+)\s*(GB|MB|KB)', stats_line2)
             if down_match2:
                 val = float(down_match2.group(1))
@@ -377,7 +382,7 @@ def get_vps_stats(vps):
                 else:
                     stats["conduit2_down_gb"] = val
                     stats["conduit2_down"] = f"{val:.1f} GB"
-    
+
     # Get Snowflake client count from logs
     if stats["snowflake_running"]:
         snowflake_log = docker_command(
@@ -389,7 +394,7 @@ def get_vps_stats(vps):
                 stats["snowflake_clients"] = int(snowflake_log.strip())
             except:
                 pass
-    
+
     # Get Tor Bridge bootstrap status
     if stats["torbridge_running"]:
         tor_log = docker_command(vps, "logs tor-bridge 2>&1 | grep -i 'bootstrap' | tail -1")
@@ -398,7 +403,7 @@ def get_vps_stats(vps):
             bootstrap_match = re.search(r'Bootstrapped (\d+)%', tor_log)
             if bootstrap_match:
                 stats["torbridge_bootstrap"] = int(bootstrap_match.group(1))
-    
+
     # Get docker stats for CPU/Memory
     docker_stats = docker_command(
         vps,
@@ -443,7 +448,7 @@ def get_vps_stats(vps):
                     if pct > 100:
                         pct = 100.0
                     stats["memory_percent"] = pct
-    
+
     return stats
 
 
@@ -452,18 +457,18 @@ def collect_stats():
     global current_stats
     vps_list = parse_config()
     all_stats = []
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(get_vps_stats, vps): vps for vps in vps_list}
         for future in as_completed(futures):
             all_stats.append(future.result())
-    
+
     all_stats.sort(key=lambda x: x["alias"])
-    
+
     now = datetime.now()
     timestamp = now.strftime("%H:%M:%S")
     full_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    
+
     # Build conduits list (each conduit instance tracked separately)
     conduits_list = []
     for s in all_stats:
@@ -487,34 +492,36 @@ def collect_stats():
                 "up_gb": s["conduit2_up_gb"],
                 "down_gb": s["conduit2_down_gb"],
             })
-    
+
     with stats_lock:
         current_stats["vps"] = all_stats
         current_stats["timestamp"] = timestamp
         current_stats["conduits"] = conduits_list
-    
+
     # Update history file
     history = load_history()
     history = cleanup_old_history(history)
-    
+
     # Add new data point - track all conduit instances separately
     connections_data = {}
     for s in all_stats:
         connections_data[f"{s['alias']}-c1"] = s["connections"]
         connections_data[f"{s['alias']}-c2"] = s["connections2"]
-    
+
     history["data"].append({
         "time": full_timestamp,
         "connections": connections_data
     })
     # Track conduit names (34 instances: 17 VPS x 2 conduits)
     history["vps_names"] = [f"{s['alias']}-c1" for s in all_stats] + [f"{s['alias']}-c2" for s in all_stats]
-    
+
     save_history(history)
-    
-    total_conn = sum(s["connections"] + s["connections2"] for s in all_stats)
+
+    total_conn = sum((s.get("connections") or 0) + (s.get("connections2") or 0) for s in all_stats)
+
     total_conduits = len(conduits_list)
-    print(f"[{timestamp}] Stats updated: {len(all_stats)} VPS, {total_conduits} conduits, {total_conn} total connections")
+    print(
+        f"[{timestamp}] Stats updated: {len(all_stats)} VPS, {total_conduits} conduits, {total_conn} total connections")
 
 
 def stats_collector_loop():
@@ -620,7 +627,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .summary-icon { font-size: 2rem; margin-bottom: 8px; }
         .summary-value { font-size: 1.8rem; font-weight: 700; color: #00d9ff; }
         .summary-label { color: #888; font-size: 0.85rem; margin-top: 4px; }
-        
+
         .chart-section {
             background: rgba(255, 255, 255, 0.03);
             border-radius: 16px;
@@ -655,7 +662,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             color: #1a1a2e;
         }
         .chart-container { position: relative; height: 350px; }
-        
+
         .vps-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -675,7 +682,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .vps-name { font-size: 1.3rem; font-weight: 600; color: #fff; }
         .vps-status { font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; background: rgba(255,255,255,0.1); }
         .vps-ip { font-family: monospace; color: #00d9ff; font-size: 0.9rem; margin-bottom: 16px; }
-        
+
         .stat-row { display: flex; justify-content: space-between; margin-bottom: 12px; }
         .stat-label { color: #888; font-size: 0.85rem; }
         .stat-value { font-weight: 600; }
@@ -684,7 +691,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .progress-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
         .progress-fill.cpu { background: linear-gradient(90deg, #00ff88, #00d9ff); }
         .progress-fill.mem { background: linear-gradient(90deg, #ff6b6b, #ffa502); }
-        
+
         .services-row { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
         .service-badge {
             display: inline-flex;
@@ -700,10 +707,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .service-badge .dot { width: 6px; height: 6px; border-radius: 50%; }
         .service-badge.running .dot { background: #00ff88; }
         .service-badge.stopped .dot { background: #ff4444; }
-        
+
         .service-section { margin-bottom: 12px; padding: 12px; background: rgba(255,255,255,0.02); border-radius: 10px; }
         .service-title { font-size: 0.85rem; color: #00d9ff; margin-bottom: 8px; font-weight: 600; }
-        
+
         .vps-footer { font-size: 0.8rem; color: #666; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.05); }
     </style>
 </head>
@@ -723,9 +730,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <span>Live • Updated: <span id="timestamp">--:--:--</span></span>
             </div>
         </header>
-        
+
         <div class="summary-grid" id="summary"></div>
-        
+
         <div class="chart-section">
             <div class="chart-title">📊 Conduit Connections Over Time (Last 2 Days)</div>
             <div class="chart-controls">
@@ -736,21 +743,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
             <div class="chart-container"><canvas id="connectionsChart"></canvas></div>
         </div>
-        
+
         <div class="chart-section">
             <div class="chart-title">📈 Current Connections by Conduit (<span id="conduitCount">0</span> instances)</div>
             <div class="chart-container" style="height: 500px;"><canvas id="currentConnChart"></canvas></div>
         </div>
-        
+
         <div class="vps-grid" id="vpsGrid"></div>
     </div>
-    
+
     <script>
         const colors = ['#00d9ff', '#00ff88', '#ff6b6b', '#ffa502', '#a55eea', '#26de81', '#fd79a8', '#74b9ff'];
+        const MASK_IP_ACTIVATED = __MASK_IP_ACTIVATED__;
         let connectionsChart, currentConnChart;
         let historyData = { data: [], vps_names: [] };
         let currentTimeRange = '24h';
-        
+
         function initCharts() {
             connectionsChart = new Chart(document.getElementById('connectionsChart'), {
                 type: 'line',
@@ -779,7 +787,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     }
                 }
             });
-            
+
             currentConnChart = new Chart(document.getElementById('currentConnChart'), {
                 type: 'bar',
                 data: { labels: [], datasets: [{ data: [], backgroundColor: colors, borderRadius: 8 }] },
@@ -787,7 +795,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     responsive: true,
                     maintainAspectRatio: false,
                     indexAxis: 'y',
-                    plugins: { legend: { display: false } },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (context) => {
+                                    const raw = context.raw;
+                                    if (raw === null || raw === undefined) return 'Connections: N/A';
+                                    return 'Connections: ' + raw;
+                                }
+                            }
+                        }
+                    },
                     scales: {
                         x: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.1)' }, ticks: { color: '#888' } },
                         y: { grid: { display: false }, ticks: { color: '#888', font: { size: 10 } } }
@@ -795,24 +814,24 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 }
             });
         }
-        
+
         function setTimeRange(range) {
             currentTimeRange = range;
             document.querySelectorAll('.chart-controls button').forEach(b => b.classList.remove('active'));
             document.getElementById('btn-' + range).classList.add('active');
             updateConnectionsChart();
         }
-        
+
         function getFilteredHistory() {
             if (!historyData.data || historyData.data.length === 0) return [];
-            
+
             const now = new Date();
             let hoursBack = 24;
             if (currentTimeRange === '1h') hoursBack = 1;
             else if (currentTimeRange === '6h') hoursBack = 6;
             else if (currentTimeRange === '24h') hoursBack = 24;
             else if (currentTimeRange === '48h') hoursBack = 48;
-            
+
             const cutoffMs = now.getTime() - (hoursBack * 60 * 60 * 1000);
             return historyData.data.filter(d => {
                 // Parse time string like "2026-01-30 18:31:22"
@@ -821,7 +840,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 return dataTime.getTime() >= cutoffMs;
             });
         }
-        
+
         function updateConnectionsChart() {
             const filtered = getFilteredHistory();
             if (filtered.length === 0) {
@@ -829,14 +848,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 connectionsChart.update('none');
                 return;
             }
-            
+
             // Show total connections as single stacked area instead of separate lines
             const totalData = filtered.map(d => {
                 const total = Object.values(d.connections || {}).reduce((a, b) => a + (b || 0), 0);
                 const timeStr = d.time.replace(' ', 'T');
                 return { x: new Date(timeStr), y: total };
             });
-            
+
             connectionsChart.data.datasets = [{
                 label: 'Total Connections',
                 data: totalData,
@@ -847,28 +866,29 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 pointRadius: 0,
                 borderWidth: 2
             }];
-            
+
             // Adjust time unit based on range
             let unit = 'hour';
             if (currentTimeRange === '1h') unit = 'minute';
             else if (currentTimeRange === '48h') unit = 'hour';
             connectionsChart.options.scales.x.time.unit = unit;
-            
+
             connectionsChart.update('none');
         }
-        
+
         function updateDashboard(data) {
             document.getElementById('timestamp').textContent = data.timestamp;
-            
+
             const vps = data.vps;
             const conduits = data.conduits || [];
+            const fmtMaybeInt = (x) => (x === null || x === undefined) ? 'N/A' : x;
             const online = vps.filter(v => v.online).length;
-            const totalConn = vps.reduce((a, v) => a + v.connections + (v.connections2 || 0), 0);
+            const totalConn = vps.reduce((a, v) => a + (v.connections || 0) + (v.connections2 || 0), 0);
             const totalConnecting = vps.reduce((a, v) => a + (v.connecting || 0) + (v.connecting2 || 0), 0);
             const totalUp = vps.reduce((a, v) => a + (v.conduit_up_gb || 0) + (v.conduit2_up_gb || 0), 0);
             const totalDown = vps.reduce((a, v) => a + (v.conduit_down_gb || 0) + (v.conduit2_down_gb || 0), 0);
             const avgCpu = vps.length ? (vps.reduce((a, v) => a + v.cpu_percent, 0) / vps.length) : 0;
-            
+
             // Count services
             const conduit1Up = vps.filter(v => v.conduit_running).length;
             const conduit2Up = vps.filter(v => v.conduit2_running).length;
@@ -876,7 +896,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const snowflakeUp = vps.filter(v => v.snowflake_running).length;
             const torbridgeUp = vps.filter(v => v.torbridge_running).length;
             const totalSnowflakeClients = vps.reduce((a, v) => a + (v.snowflake_clients || 0), 0);
-            
+
             document.getElementById('summary').innerHTML = `
                 <div class="summary-card"><div class="summary-icon">🖥️</div><div class="summary-value">${online}/${vps.length}</div><div class="summary-label">VPS Online</div></div>
                 <div class="summary-card"><div class="summary-icon">🚀</div><div class="summary-value" style="color:#00d9ff">${totalConduits}</div><div class="summary-label">Conduits (${conduit1Up}+${conduit2Up})</div></div>
@@ -887,7 +907,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="summary-card"><div class="summary-icon">📤</div><div class="summary-value">${totalUp.toFixed(1)}</div><div class="summary-label">Upload (GB)</div></div>
                 <div class="summary-card"><div class="summary-icon">📥</div><div class="summary-value">${totalDown.toFixed(1)}</div><div class="summary-label">Download (GB)</div></div>
             `;
-            
+
             // Update current connections bar chart - show all conduits
             const conduitLabels = conduits.map(c => c.name);
             const conduitConns = conduits.map(c => c.connections);
@@ -895,12 +915,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             currentConnChart.data.datasets[0].data = conduitConns;
             currentConnChart.data.datasets[0].backgroundColor = conduits.map((c, i) => colors[i % colors.length]);
             currentConnChart.update('none');
-            
+
             // Update conduit count in chart title
             document.getElementById('conduitCount').textContent = conduits.length;
-            
+
             // VPS cards - mask IPs for security
             function maskIP(ip) {
+                if (!MASK_IP_ACTIVATED) return ip;
                 const parts = ip.split('.');
                 if (parts.length === 4) return parts[0] + '.' + parts[1] + '.***.***';
                 return '***.***.***.***';
@@ -912,7 +933,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <span class="vps-status">${v.online ? '🟢 Online' : '🔴 Offline'}</span>
                     </div>
                     <div class="vps-ip">${maskIP(v.ip)}</div>
-                    
+
                     <div class="services-row">
                         <span class="service-badge ${v.conduit_running ? 'running' : 'stopped'}">
                             <span class="dot"></span>C1
@@ -927,7 +948,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             <span class="dot"></span>Tor
                         </span>
                     </div>
-                    
+
                     ${v.conduit_running || v.conduit2_running ? `
                     <div class="service-section">
                         <div class="service-title">🚀 Conduit Instances</div>
@@ -936,7 +957,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             <div style="font-size:0.75rem;color:#00d9ff;margin-bottom:4px;">C1 (${v.conduit_uptime})</div>
                             <div class="stat-row">
                                 <span class="stat-label">Connected / Connecting</span>
-                                <span class="stat-value highlight">${v.connections} <span style="color:#ffa502;font-size:0.9rem">/ ${v.connecting || 0}</span></span>
+                                <span class="stat-value highlight">${fmtMaybeInt(v.connections)} <span style="color:#ffa502;font-size:0.9rem">/ ${fmtMaybeInt(v.connecting)}</span></span>
                             </div>
                             <div class="stat-row">
                                 <span class="stat-label">↑↓ Traffic</span>
@@ -949,7 +970,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             <div style="font-size:0.75rem;color:#00ff88;margin-bottom:4px;">C2 (${v.conduit2_uptime})</div>
                             <div class="stat-row">
                                 <span class="stat-label">Connected / Connecting</span>
-                                <span class="stat-value highlight">${v.connections2 || 0} <span style="color:#ffa502;font-size:0.9rem">/ ${v.connecting2 || 0}</span></span>
+                                <span class="stat-value highlight">${fmtMaybeInt(v.connections2)} <span style="color:#ffa502;font-size:0.9rem">/ ${fmtMaybeInt(v.connecting2)}</span></span>
                             </div>
                             <div class="stat-row">
                                 <span class="stat-label">↑↓ Traffic</span>
@@ -959,13 +980,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         ` : ''}
                     </div>
                     ` : ''}
-                    
+
                     ${v.snowflake_running ? `
                     <div class="service-section">
                         <div class="service-title">❄️ Snowflake (WebRTC)</div>
                         <div class="stat-row">
                             <span class="stat-label">Clients Served</span>
-                            <span class="stat-value" style="color:#a55eea">${v.snowflake_clients || 0}</span>
+                            <span class="stat-value" style="color:#a55eea">${fmtMaybeInt(v.snowflake_clients)}</span>
                         </div>
                         <div class="stat-row">
                             <span class="stat-label">Uptime</span>
@@ -973,7 +994,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         </div>
                     </div>
                     ` : ''}
-                    
+
                     ${v.torbridge_running ? `
                     <div class="service-section">
                         <div class="service-title">🌉 Tor Bridge (obfs4)</div>
@@ -988,7 +1009,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         </div>
                     </div>
                     ` : ''}
-                    
+
                     <div class="stat-row" style="margin-top:12px">
                         <span class="stat-label">CPU</span>
                         <span class="stat-value">${v.cpu_percent.toFixed(1)}%</span>
@@ -1003,7 +1024,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </div>
             `).join('');
         }
-        
+
         async function fetchStats() {
             try {
                 const [statsRes, historyRes] = await Promise.all([
@@ -1012,21 +1033,20 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 ]);
                 const statsData = await statsRes.json();
                 historyData = await historyRes.json();
-                
+
                 updateDashboard(statsData);
                 updateConnectionsChart();
             } catch (e) {
                 console.error('Failed to fetch stats:', e);
             }
         }
-        
+
         initCharts();
         fetchStats();
         setInterval(fetchStats, 5000);
     </script>
 </body>
 </html>'''
-
 
 # Load logo image at startup
 LOGO_FILE = SCRIPT_DIR / "lionandsun.jpeg"
@@ -1039,13 +1059,13 @@ if LOGO_FILE.exists():
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress HTTP logs
-    
+
     def do_HEAD(self):
         """Handle HEAD requests (used by health checks)."""
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
-    
+
     def do_GET(self):
         if self.path == '/api/stats':
             self.send_response(200)
@@ -1075,8 +1095,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode())
-
+            html = HTML_TEMPLATE.replace(
+                "__MASK_IP_ACTIVATED__",
+                "true" if MASK_IP_ACTIVATED else "false"
+            )
+            self.wfile.write(html.encode())
 
 def main():
     print("=" * 60)
@@ -1087,7 +1110,7 @@ def main():
     print(f"📁 History file: {HISTORY_FILE}")
     print(f"📅 Keeping {HISTORY_DAYS} days of connection history")
     print()
-    
+
     # Start HTTP server first (non-blocking)
     server = HTTPServer(('0.0.0.0', PORT), DashboardHandler)
     print(f"✅ Dashboard running at: http://localhost:{PORT}")
@@ -1096,11 +1119,11 @@ def main():
     print("📊 Collecting initial stats in background...")
     print("Press Ctrl+C to stop")
     print()
-    
+
     # Start background collector (will do initial collection immediately)
     collector_thread = threading.Thread(target=stats_collector_loop, daemon=True)
     collector_thread.start()
-    
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
