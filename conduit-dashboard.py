@@ -22,8 +22,9 @@ HISTORY_FILE = SCRIPT_DIR / "conduit-history.json"
 PORT = 5050
 REFRESH_INTERVAL = 15  # seconds
 SSH_TIMEOUT = 15 # seconds
+SSH_CONNECT_TIMEOUT = 10
+SSH_Server_Alive_Interval = 30
 HISTORY_DAYS = 2  # Keep 2 days of history
-
 
 # Service names we track
 SERVICES = ["conduit", "conduit2", "snowflake", "tor-bridge"]
@@ -97,12 +98,15 @@ def mask_ip(ip):
 
 def ssh_command(vps, cmd):
     """Execute SSH command on VPS."""
-    ssh_opts = "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=30"
+    ssh_opts = f"-o StrictHostKeyChecking=no -o ConnectTimeout={SSH_CONNECT_TIMEOUT} -o ServerAliveInterval={SSH_Server_Alive_Interval}"
     
     if vps["password"] and vps["password"] != "-":
         full_cmd = f"sshpass -p '{vps['password']}' ssh {ssh_opts} -p {vps['port']} {vps['user']}@{vps['ip']} \"{cmd}\""
     else:
         full_cmd = f"ssh {ssh_opts} -p {vps['port']} {vps['user']}@{vps['ip']} \"{cmd}\""
+
+    if vps["ip"] in ("127.0.0.1", "LOCAL", "Local", "local"):
+        full_cmd = cmd
     
     try:
         result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=SSH_TIMEOUT)
