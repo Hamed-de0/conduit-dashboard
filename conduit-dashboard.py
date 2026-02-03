@@ -304,82 +304,112 @@ def get_vps_stats(vps):
         stats_line = docker_command(vps, "logs --since 10m --tail 100 conduit | grep '\[STATS\]' | tail -1")
         if stats_line:
             # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
+            # Also handle: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1GB | Down: 74.1GB | Uptime: 3h47m8s
 
-            connecting_match = re.search(r'Connecting:\s*(\d+)', stats_line)
+            connecting_match = re.search(r'Connecting:\s*(\d+)', stats_line, re.IGNORECASE)
             if connecting_match:
                 stats["connecting"] = int(connecting_match.group(1))
 
-            connected_match = re.search(r'Connected:\s*(\d+)', stats_line)
+            connected_match = re.search(r'Connected:\s*(\d+)', stats_line, re.IGNORECASE)
             if connected_match:
                 stats["connections"] = int(connected_match.group(1))
 
-            up_match = re.search(r'Up:\s*([\d.]+)\s*(GB|MB|KB)', stats_line)
+            # More flexible regex to handle spaces and case variations
+            up_match = re.search(r'Up:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line, re.IGNORECASE)
             if up_match:
                 val = float(up_match.group(1))
-                unit = up_match.group(2)
+                unit = up_match.group(2).upper()
                 # Convert to GB for totals
-                if unit == "KB":
+                if unit == "B":
+                    stats["conduit_up_gb"] = val / 1024 / 1024 / 1024
+                    stats["conduit_up"] = f"{val:.1f} B"
+                elif unit == "KB":
                     stats["conduit_up_gb"] = val / 1024 / 1024
                     stats["conduit_up"] = f"{val:.1f} KB"
                 elif unit == "MB":
                     stats["conduit_up_gb"] = val / 1024
                     stats["conduit_up"] = f"{val:.1f} MB"
-                else:
+                elif unit == "TB":
+                    stats["conduit_up_gb"] = val * 1024
+                    stats["conduit_up"] = f"{val:.2f} TB"
+                else:  # GB
                     stats["conduit_up_gb"] = val
                     stats["conduit_up"] = f"{val:.1f} GB"
 
-            down_match = re.search(r'Down:\s*([\d.]+)\s*(GB|MB|KB)', stats_line)
+            down_match = re.search(r'Down:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line, re.IGNORECASE)
             if down_match:
                 val = float(down_match.group(1))
-                unit = down_match.group(2)
+                unit = down_match.group(2).upper()
                 # Convert to GB for totals
-                if unit == "KB":
+                if unit == "B":
+                    stats["conduit_down_gb"] = val / 1024 / 1024 / 1024
+                    stats["conduit_down"] = f"{val:.1f} B"
+                elif unit == "KB":
                     stats["conduit_down_gb"] = val / 1024 / 1024
                     stats["conduit_down"] = f"{val:.1f} KB"
                 elif unit == "MB":
                     stats["conduit_down_gb"] = val / 1024
                     stats["conduit_down"] = f"{val:.1f} MB"
-                else:
+                elif unit == "TB":
+                    stats["conduit_down_gb"] = val * 1024
+                    stats["conduit_down"] = f"{val:.2f} TB"
+                else:  # GB
                     stats["conduit_down_gb"] = val
                     stats["conduit_down"] = f"{val:.1f} GB"
 
     # Get Conduit2 connection count from [STATS] log line
     if stats["conduit2_running"]:
-        stats_line2 = docker_command(vps, "logs --since 10m --tail 100 conduit | grep '\[STATS\]' | tail -1")
+        stats_line2 = docker_command(vps, "logs --since 10m --tail 100 conduit2 | grep '\[STATS\]' | tail -1")
         if stats_line2:
-            connecting_match2 = re.search(r'Connecting:\s*(\d+)', stats_line2)
+            # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
+            # Also handle: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1GB | Down: 74.1GB | Uptime: 3h47m8s
+
+            connecting_match2 = re.search(r'Connecting:\s*(\d+)', stats_line2, re.IGNORECASE)
             if connecting_match2:
                 stats["connecting2"] = int(connecting_match2.group(1))
 
-            connected_match2 = re.search(r'Connected:\s*(\d+)', stats_line2)
+            connected_match2 = re.search(r'Connected:\s*(\d+)', stats_line2, re.IGNORECASE)
             if connected_match2:
                 stats["connections2"] = int(connected_match2.group(1))
 
-            up_match2 = re.search(r'Up:\s*([\d.]+)\s*(GB|MB|KB)', stats_line2)
+            # More flexible regex to handle spaces and case variations
+            up_match2 = re.search(r'Up:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line2, re.IGNORECASE)
             if up_match2:
                 val = float(up_match2.group(1))
-                unit = up_match2.group(2)
-                if unit == "KB":
+                unit = up_match2.group(2).upper()
+                if unit == "B":
+                    stats["conduit2_up_gb"] = val / 1024 / 1024 / 1024
+                    stats["conduit2_up"] = f"{val:.1f} B"
+                elif unit == "KB":
                     stats["conduit2_up_gb"] = val / 1024 / 1024
                     stats["conduit2_up"] = f"{val:.1f} KB"
                 elif unit == "MB":
                     stats["conduit2_up_gb"] = val / 1024
                     stats["conduit2_up"] = f"{val:.1f} MB"
-                else:
+                elif unit == "TB":
+                    stats["conduit2_up_gb"] = val * 1024
+                    stats["conduit2_up"] = f"{val:.2f} TB"
+                else:  # GB
                     stats["conduit2_up_gb"] = val
                     stats["conduit2_up"] = f"{val:.1f} GB"
 
-            down_match2 = re.search(r'Down:\s*([\d.]+)\s*(GB|MB|KB)', stats_line2)
+            down_match2 = re.search(r'Down:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line2, re.IGNORECASE)
             if down_match2:
                 val = float(down_match2.group(1))
-                unit = down_match2.group(2)
-                if unit == "KB":
+                unit = down_match2.group(2).upper()
+                if unit == "B":
+                    stats["conduit2_down_gb"] = val / 1024 / 1024 / 1024
+                    stats["conduit2_down"] = f"{val:.1f} B"
+                elif unit == "KB":
                     stats["conduit2_down_gb"] = val / 1024 / 1024
                     stats["conduit2_down"] = f"{val:.1f} KB"
                 elif unit == "MB":
                     stats["conduit2_down_gb"] = val / 1024
                     stats["conduit2_down"] = f"{val:.1f} MB"
-                else:
+                elif unit == "TB":
+                    stats["conduit2_down_gb"] = val * 1024
+                    stats["conduit2_down"] = f"{val:.2f} TB"
+                else:  # GB
                     stats["conduit2_down_gb"] = val
                     stats["conduit2_down"] = f"{val:.1f} GB"
 
