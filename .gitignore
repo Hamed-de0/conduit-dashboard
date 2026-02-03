@@ -51,3 +51,12 @@ add_vless.py
 vless-dashboard.py
 generate_vless_configs.py
 links-config.txt
+fix-and-experiment-stuck-vps.sh
+fix-conduits.sh
+setup-conduit.sh
+setup-single-xray.sh
+setup-xray-all.sh
+stuck-fix-log-20260201-1209.txt
+.gitignore
+.gitignore
+xray-configs.txt
