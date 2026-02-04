@@ -53,7 +53,7 @@ def load_history():
         try:
             with open(HISTORY_FILE, "r") as f:
                 return json.load(f)
-        except:
+        except (json.JSONDecodeError, IOError):
             pass
     return {"data": [], "vps_names": []}
 
@@ -212,6 +212,18 @@ def get_vps_hardware(vps):
     return cpu_cores, mem_total_mb
 
 
+def format_traffic_gb(total_gb):
+    """Format traffic in GB to human-readable string (B, KB, MB, GB, TB)."""
+    if total_gb >= 1024:
+        return f"{total_gb / 1024:.2f} TB"
+    elif total_gb >= 1:
+        return f"{total_gb:.1f} GB"
+    elif total_gb >= 0.001:
+        return f"{total_gb * 1024:.1f} MB"
+    else:
+        return "0 B"
+
+
 def parse_conduit_stats(stats_line):
     """Parse conduit stats from a [STATS] log line. Returns dict with connections, traffic, etc."""
     result = {
@@ -325,7 +337,6 @@ def get_vps_stats(vps):
         "ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null"
     )
 
-    # Track all detected conduit containers (conduit, conduit2, conduit3, conduit4, conduit5)
     detected_conduits = []
 
     if container_info:
@@ -342,11 +353,10 @@ def get_vps_stats(vps):
                 if uptime_match:
                     uptime_str = uptime_match.group(1).strip()
 
-            # Detect conduit containers (conduit, conduit2, conduit-2, conduit3, conduit-3, etc.)
             # Match both formats: "conduit", "conduit2", "conduit-2", "conduit-3", etc.
             conduit_match = re.match(r'^conduit(-?\d*)$', name)
             if conduit_match:
-                # Extract instance number (1 for "conduit", 2 for "conduit2" or "conduit-2", etc.)
+                # Extract instance number (1 for "conduit", 2+ for numbered instances)
                 suffix = conduit_match.group(1)
                 if suffix == "" or suffix == "-":
                     instance_num = 1
@@ -421,24 +431,9 @@ def get_vps_stats(vps):
         total_up_gb = sum((c.get("up_gb") or 0) for c in running_conduits)
         total_down_gb = sum((c.get("down_gb") or 0) for c in running_conduits)
         
-        # Format aggregated traffic (convert back to human-readable)
-        if total_up_gb >= 1024:
-            stats["conduit_up"] = f"{total_up_gb / 1024:.2f} TB"
-        elif total_up_gb >= 1:
-            stats["conduit_up"] = f"{total_up_gb:.1f} GB"
-        elif total_up_gb >= 0.001:
-            stats["conduit_up"] = f"{total_up_gb * 1024:.1f} MB"
-        else:
-            stats["conduit_up"] = "0 B"
-            
-        if total_down_gb >= 1024:
-            stats["conduit_down"] = f"{total_down_gb / 1024:.2f} TB"
-        elif total_down_gb >= 1:
-            stats["conduit_down"] = f"{total_down_gb:.1f} GB"
-        elif total_down_gb >= 0.001:
-            stats["conduit_down"] = f"{total_down_gb * 1024:.1f} MB"
-        else:
-            stats["conduit_down"] = "0 B"
+        # Format aggregated traffic using helper function
+        stats["conduit_up"] = format_traffic_gb(total_up_gb)
+        stats["conduit_down"] = format_traffic_gb(total_down_gb)
         
         # Set aggregated fields for frontend compatibility
         stats["conduit_running"] = True
@@ -962,6 +957,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             connectionsChart.update('none');
         }
 
+        function formatTrafficGB(totalGB) {
+            if (totalGB >= 1024) {
+                return { value: (totalGB / 1024).toFixed(2), unit: 'TB' };
+            } else if (totalGB >= 1) {
+                return { value: totalGB.toFixed(1), unit: 'GB' };
+            } else if (totalGB >= 0.001) {
+                return { value: (totalGB * 1024).toFixed(1), unit: 'MB' };
+            } else {
+                return { value: '0', unit: 'B' };
+            }
+        }
+
         function updateDashboard(data) {
             document.getElementById('timestamp').textContent = data.timestamp;
 
@@ -976,6 +983,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const totalUp = conduits.reduce((a, c) => a + (c.up_gb || 0), 0);
             const totalDown = conduits.reduce((a, c) => a + (c.down_gb || 0), 0);
             const avgCpu = vps.length ? (vps.reduce((a, v) => a + v.cpu_percent, 0) / vps.length) : 0;
+            
+            // Format traffic for display
+            const upFormatted = formatTrafficGB(totalUp);
+            const downFormatted = formatTrafficGB(totalDown);
 
             // Count services - count all running conduit instances
             const totalConduits = conduits.length;
@@ -997,8 +1008,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="summary-card"><div class="summary-icon">🌉</div><div class="summary-value" style="color:#ff6b6b">${torbridgeUp}</div><div class="summary-label">Tor Bridge</div></div>
                 <div class="summary-card"><div class="summary-icon">🔗</div><div class="summary-value">${totalConn}</div><div class="summary-label">Conduit Users</div></div>
                 <div class="summary-card"><div class="summary-icon">⏳</div><div class="summary-value" style="color:#ffa502">${totalConnecting}</div><div class="summary-label">Connecting</div></div>
-                <div class="summary-card"><div class="summary-icon">📤</div><div class="summary-value">${totalUp.toFixed(1)}</div><div class="summary-label">Upload (GB)</div></div>
-                <div class="summary-card"><div class="summary-icon">📥</div><div class="summary-value">${totalDown.toFixed(1)}</div><div class="summary-label">Download (GB)</div></div>
+                <div class="summary-card"><div class="summary-icon">📤</div><div class="summary-value">${upFormatted.value}</div><div class="summary-label">Upload (${upFormatted.unit})</div></div>
+                <div class="summary-card"><div class="summary-icon">📥</div><div class="summary-value">${downFormatted.value}</div><div class="summary-label">Download (${downFormatted.unit})</div></div>
             `;
 
             // Update current connections bar chart - show all conduits
