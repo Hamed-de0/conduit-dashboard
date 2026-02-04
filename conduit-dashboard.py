@@ -212,6 +212,75 @@ def get_vps_hardware(vps):
     return cpu_cores, mem_total_mb
 
 
+def parse_conduit_stats(stats_line):
+    """Parse conduit stats from a [STATS] log line. Returns dict with connections, traffic, etc."""
+    result = {
+        "connections": None,
+        "connecting": None,
+        "up": "N/A",
+        "down": "N/A",
+        "up_gb": 0,
+        "down_gb": 0,
+    }
+    
+    if not stats_line:
+        return result
+    
+    # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
+    connecting_match = re.search(r'Connecting:\s*(\d+)', stats_line, re.IGNORECASE)
+    if connecting_match:
+        result["connecting"] = int(connecting_match.group(1))
+
+    connected_match = re.search(r'Connected:\s*(\d+)', stats_line, re.IGNORECASE)
+    if connected_match:
+        result["connections"] = int(connected_match.group(1))
+
+    # More flexible regex to handle spaces and case variations
+    up_match = re.search(r'Up:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line, re.IGNORECASE)
+    if up_match:
+        val = float(up_match.group(1))
+        unit = up_match.group(2).upper()
+        # Convert to GB for totals
+        if unit == "B":
+            result["up_gb"] = val / 1024 / 1024 / 1024
+            result["up"] = f"{val:.1f} B"
+        elif unit == "KB":
+            result["up_gb"] = val / 1024 / 1024
+            result["up"] = f"{val:.1f} KB"
+        elif unit == "MB":
+            result["up_gb"] = val / 1024
+            result["up"] = f"{val:.1f} MB"
+        elif unit == "TB":
+            result["up_gb"] = val * 1024
+            result["up"] = f"{val:.2f} TB"
+        else:  # GB
+            result["up_gb"] = val
+            result["up"] = f"{val:.1f} GB"
+
+    down_match = re.search(r'Down:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line, re.IGNORECASE)
+    if down_match:
+        val = float(down_match.group(1))
+        unit = down_match.group(2).upper()
+        # Convert to GB for totals
+        if unit == "B":
+            result["down_gb"] = val / 1024 / 1024 / 1024
+            result["down"] = f"{val:.1f} B"
+        elif unit == "KB":
+            result["down_gb"] = val / 1024 / 1024
+            result["down"] = f"{val:.1f} KB"
+        elif unit == "MB":
+            result["down_gb"] = val / 1024
+            result["down"] = f"{val:.1f} MB"
+        elif unit == "TB":
+            result["down_gb"] = val * 1024
+            result["down"] = f"{val:.2f} TB"
+        else:  # GB
+            result["down_gb"] = val
+            result["down"] = f"{val:.1f} GB"
+    
+    return result
+
+
 def get_vps_stats(vps):
     """Collect all stats from a single VPS."""
     stats = {
@@ -219,24 +288,8 @@ def get_vps_stats(vps):
         "ip": vps["ip"],
         "comment": vps["comment"],
         "online": False,
-        # Conduit 1 stats
-        "conduit_running": False,
-        "conduit_uptime": "N/A",
-        "connections": None,
-        "connecting": None,
-        "conduit_up": "N/A",
-        "conduit_down": "N/A",
-        "conduit_up_gb": 0,
-        "conduit_down_gb": 0,
-        # Conduit 2 stats
-        "conduit2_running": False,
-        "conduit2_uptime": "N/A",
-        "connections2": None,
-        "connecting2": None,
-        "conduit2_up": "N/A",
-        "conduit2_down": "N/A",
-        "conduit2_up_gb": 0,
-        "conduit2_down_gb": 0,
+        # Conduit instances (dynamically detected, up to 5)
+        "conduits": [],
         # Snowflake stats
         "snowflake_running": False,
         "snowflake_uptime": "N/A",
@@ -272,6 +325,9 @@ def get_vps_stats(vps):
         "ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null"
     )
 
+    # Track all detected conduit containers (conduit, conduit2, conduit3, conduit4, conduit5)
+    detected_conduits = []
+
     if container_info:
         for line in container_info.split('\n'):
             if '|' not in line:
@@ -286,12 +342,24 @@ def get_vps_stats(vps):
                 if uptime_match:
                     uptime_str = uptime_match.group(1).strip()
 
-            if name == "conduit":
-                stats["conduit_running"] = is_up
-                stats["conduit_uptime"] = uptime_str
-            elif name == "conduit2":
-                stats["conduit2_running"] = is_up
-                stats["conduit2_uptime"] = uptime_str
+            # Detect conduit containers (conduit, conduit2, conduit-2, conduit3, conduit-3, etc.)
+            # Match both formats: "conduit", "conduit2", "conduit-2", "conduit-3", etc.
+            conduit_match = re.match(r'^conduit(-?\d*)$', name)
+            if conduit_match:
+                # Extract instance number (1 for "conduit", 2 for "conduit2" or "conduit-2", etc.)
+                suffix = conduit_match.group(1)
+                if suffix == "" or suffix == "-":
+                    instance_num = 1
+                else:
+                    # Remove hyphen if present and convert to int
+                    instance_num = int(suffix.replace("-", ""))
+                
+                detected_conduits.append({
+                    "name": name,
+                    "instance": instance_num,
+                    "running": is_up,
+                    "uptime": uptime_str
+                })
             elif name == "snowflake":
                 stats["snowflake_running"] = is_up
                 stats["snowflake_uptime"] = uptime_str
@@ -299,119 +367,94 @@ def get_vps_stats(vps):
                 stats["torbridge_running"] = is_up
                 stats["torbridge_uptime"] = uptime_str
 
-    # Get Conduit connection count from [STATS] log line
-    if stats["conduit_running"]:
-        stats_line = docker_command(vps, "logs --since 10m --tail 100 conduit | grep '\[STATS\]' | tail -1")
-        if stats_line:
-            # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
-            # Also handle: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1GB | Down: 74.1GB | Uptime: 3h47m8s
+    # Sort conduits by instance number
+    detected_conduits.sort(key=lambda x: x["instance"])
 
-            connecting_match = re.search(r'Connecting:\s*(\d+)', stats_line, re.IGNORECASE)
-            if connecting_match:
-                stats["connecting"] = int(connecting_match.group(1))
+    # Get stats for each detected conduit container
+    for conduit_info in detected_conduits:
+        if not conduit_info["running"]:
+            # Still add it to the list but mark as not running
+            stats["conduits"].append({
+                "name": conduit_info["name"],
+                "instance": conduit_info["instance"],
+                "running": False,
+                "uptime": "N/A",
+                "connections": None,
+                "connecting": None,
+                "up": "N/A",
+                "down": "N/A",
+                "up_gb": 0,
+                "down_gb": 0,
+            })
+            continue
 
-            connected_match = re.search(r'Connected:\s*(\d+)', stats_line, re.IGNORECASE)
-            if connected_match:
-                stats["connections"] = int(connected_match.group(1))
+        # Get stats from logs
+        container_name = conduit_info["name"]
+        stats_line = docker_command(
+            vps,
+            f"logs --since 10m --tail 100 {container_name} | grep '\\[STATS\\]' | tail -1"
+        )
+        
+        # Parse stats using helper function
+        parsed_stats = parse_conduit_stats(stats_line)
+        
+        # Add to conduits list
+        stats["conduits"].append({
+            "name": container_name,
+            "instance": conduit_info["instance"],
+            "running": True,
+            "uptime": conduit_info["uptime"],
+            "connections": parsed_stats["connections"],
+            "connecting": parsed_stats["connecting"],
+            "up": parsed_stats["up"],
+            "down": parsed_stats["down"],
+            "up_gb": parsed_stats["up_gb"],
+            "down_gb": parsed_stats["down_gb"],
+        })
 
-            # More flexible regex to handle spaces and case variations
-            up_match = re.search(r'Up:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line, re.IGNORECASE)
-            if up_match:
-                val = float(up_match.group(1))
-                unit = up_match.group(2).upper()
-                # Convert to GB for totals
-                if unit == "B":
-                    stats["conduit_up_gb"] = val / 1024 / 1024 / 1024
-                    stats["conduit_up"] = f"{val:.1f} B"
-                elif unit == "KB":
-                    stats["conduit_up_gb"] = val / 1024 / 1024
-                    stats["conduit_up"] = f"{val:.1f} KB"
-                elif unit == "MB":
-                    stats["conduit_up_gb"] = val / 1024
-                    stats["conduit_up"] = f"{val:.1f} MB"
-                elif unit == "TB":
-                    stats["conduit_up_gb"] = val * 1024
-                    stats["conduit_up"] = f"{val:.2f} TB"
-                else:  # GB
-                    stats["conduit_up_gb"] = val
-                    stats["conduit_up"] = f"{val:.1f} GB"
-
-            down_match = re.search(r'Down:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line, re.IGNORECASE)
-            if down_match:
-                val = float(down_match.group(1))
-                unit = down_match.group(2).upper()
-                # Convert to GB for totals
-                if unit == "B":
-                    stats["conduit_down_gb"] = val / 1024 / 1024 / 1024
-                    stats["conduit_down"] = f"{val:.1f} B"
-                elif unit == "KB":
-                    stats["conduit_down_gb"] = val / 1024 / 1024
-                    stats["conduit_down"] = f"{val:.1f} KB"
-                elif unit == "MB":
-                    stats["conduit_down_gb"] = val / 1024
-                    stats["conduit_down"] = f"{val:.1f} MB"
-                elif unit == "TB":
-                    stats["conduit_down_gb"] = val * 1024
-                    stats["conduit_down"] = f"{val:.2f} TB"
-                else:  # GB
-                    stats["conduit_down_gb"] = val
-                    stats["conduit_down"] = f"{val:.1f} GB"
-
-    # Get Conduit2 connection count from [STATS] log line
-    if stats["conduit2_running"]:
-        stats_line2 = docker_command(vps, "logs --since 10m --tail 100 conduit2 | grep '\[STATS\]' | tail -1")
-        if stats_line2:
-            # Parse: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1 GB | Down: 74.1 GB | Uptime: 3h47m8s
-            # Also handle: [STATS] Connecting: 17 | Connected: 226 | Up: 7.1GB | Down: 74.1GB | Uptime: 3h47m8s
-
-            connecting_match2 = re.search(r'Connecting:\s*(\d+)', stats_line2, re.IGNORECASE)
-            if connecting_match2:
-                stats["connecting2"] = int(connecting_match2.group(1))
-
-            connected_match2 = re.search(r'Connected:\s*(\d+)', stats_line2, re.IGNORECASE)
-            if connected_match2:
-                stats["connections2"] = int(connected_match2.group(1))
-
-            # More flexible regex to handle spaces and case variations
-            up_match2 = re.search(r'Up:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line2, re.IGNORECASE)
-            if up_match2:
-                val = float(up_match2.group(1))
-                unit = up_match2.group(2).upper()
-                if unit == "B":
-                    stats["conduit2_up_gb"] = val / 1024 / 1024 / 1024
-                    stats["conduit2_up"] = f"{val:.1f} B"
-                elif unit == "KB":
-                    stats["conduit2_up_gb"] = val / 1024 / 1024
-                    stats["conduit2_up"] = f"{val:.1f} KB"
-                elif unit == "MB":
-                    stats["conduit2_up_gb"] = val / 1024
-                    stats["conduit2_up"] = f"{val:.1f} MB"
-                elif unit == "TB":
-                    stats["conduit2_up_gb"] = val * 1024
-                    stats["conduit2_up"] = f"{val:.2f} TB"
-                else:  # GB
-                    stats["conduit2_up_gb"] = val
-                    stats["conduit2_up"] = f"{val:.1f} GB"
-
-            down_match2 = re.search(r'Down:\s*([\d.]+)\s*(TB|GB|MB|KB|B)', stats_line2, re.IGNORECASE)
-            if down_match2:
-                val = float(down_match2.group(1))
-                unit = down_match2.group(2).upper()
-                if unit == "B":
-                    stats["conduit2_down_gb"] = val / 1024 / 1024 / 1024
-                    stats["conduit2_down"] = f"{val:.1f} B"
-                elif unit == "KB":
-                    stats["conduit2_down_gb"] = val / 1024 / 1024
-                    stats["conduit2_down"] = f"{val:.1f} KB"
-                elif unit == "MB":
-                    stats["conduit2_down_gb"] = val / 1024
-                    stats["conduit2_down"] = f"{val:.1f} MB"
-                elif unit == "TB":
-                    stats["conduit2_down_gb"] = val * 1024
-                    stats["conduit2_down"] = f"{val:.2f} TB"
-                else:  # GB
-                    stats["conduit2_down_gb"] = val
-                    stats["conduit2_down"] = f"{val:.1f} GB"
+    # Aggregate all conduit stats for this VPS
+    running_conduits = [c for c in stats["conduits"] if c["running"]]
+    if running_conduits:
+        # Aggregate connections and traffic
+        total_connections = sum((c.get("connections") or 0) for c in running_conduits)
+        total_connecting = sum((c.get("connecting") or 0) for c in running_conduits)
+        total_up_gb = sum((c.get("up_gb") or 0) for c in running_conduits)
+        total_down_gb = sum((c.get("down_gb") or 0) for c in running_conduits)
+        
+        # Format aggregated traffic (convert back to human-readable)
+        if total_up_gb >= 1024:
+            stats["conduit_up"] = f"{total_up_gb / 1024:.2f} TB"
+        elif total_up_gb >= 1:
+            stats["conduit_up"] = f"{total_up_gb:.1f} GB"
+        elif total_up_gb >= 0.001:
+            stats["conduit_up"] = f"{total_up_gb * 1024:.1f} MB"
+        else:
+            stats["conduit_up"] = "0 B"
+            
+        if total_down_gb >= 1024:
+            stats["conduit_down"] = f"{total_down_gb / 1024:.2f} TB"
+        elif total_down_gb >= 1:
+            stats["conduit_down"] = f"{total_down_gb:.1f} GB"
+        elif total_down_gb >= 0.001:
+            stats["conduit_down"] = f"{total_down_gb * 1024:.1f} MB"
+        else:
+            stats["conduit_down"] = "0 B"
+        
+        # Set aggregated fields for frontend compatibility
+        stats["conduit_running"] = True
+        stats["connections"] = total_connections
+        stats["connecting"] = total_connecting
+        # Use the longest uptime as representative
+        stats["conduit_uptime"] = max((c.get("uptime", "N/A") for c in running_conduits), key=lambda x: len(x) if x != "N/A" else 0)
+        stats["conduit_count"] = len(running_conduits)
+    else:
+        stats["conduit_running"] = False
+        stats["connections"] = None
+        stats["connecting"] = None
+        stats["conduit_up"] = "N/A"
+        stats["conduit_down"] = "N/A"
+        stats["conduit_uptime"] = "N/A"
+        stats["conduit_count"] = 0
 
     # Get Snowflake client count from logs
     if stats["snowflake_running"]:
@@ -434,50 +477,64 @@ def get_vps_stats(vps):
             if bootstrap_match:
                 stats["torbridge_bootstrap"] = int(bootstrap_match.group(1))
 
-    # Get docker stats for CPU/Memory
-    docker_stats = docker_command(
-        vps,
-        "stats conduit --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' 2>/dev/null"
-    )
+    # Get docker stats for CPU/Memory - aggregate across all running conduits
+    running_conduit_names = [c["name"] for c in stats["conduits"] if c["running"]]
+    total_cpu_percent = 0.0
+    total_memory_mb = 0.0
+    
+    for conduit_name in running_conduit_names:
+        docker_stats = docker_command(
+            vps,
+            f"stats {conduit_name} --no-stream --format '{{{{.CPUPerc}}}}|{{{{.MemUsage}}}}' 2>/dev/null"
+        )
 
-    if docker_stats:
-        parts = docker_stats.split("|")
-        if len(parts) >= 2:
-            # CPU: normalize Docker CPU% to 0-100 by dividing by VPS core count
-            try:
-                raw_cpu = float(parts[0].replace("%", "").strip())
-                cores = stats.get("cpu_cores") or 1
-                stats["cpu_percent"] = raw_cpu / float(cores) if cores else raw_cpu
-                if stats["cpu_percent"] < 0:
-                    stats["cpu_percent"] = 0
-            except:
-                pass
+        if docker_stats:
+            parts = docker_stats.split("|")
+            if len(parts) >= 2:
+                # CPU: normalize Docker CPU% to 0-100 by dividing by VPS core count
+                try:
+                    raw_cpu = float(parts[0].replace("%", "").strip())
+                    cores = stats.get("cpu_cores") or 1
+                    cpu_pct = raw_cpu / float(cores) if cores else raw_cpu
+                    if cpu_pct > 0:
+                        total_cpu_percent += cpu_pct
+                except:
+                    pass
 
-            # Memory: take container used memory, compute % of total VPS RAM
-            # docker MemUsage usually looks like: "238MiB / 7.57GiB"
-            mem_match = re.search(r'([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB)', parts[1])
-            if mem_match:
-                mem_val = float(mem_match.group(1))
-                unit = mem_match.group(2)
+                # Memory: take container used memory
+                # docker MemUsage usually looks like: "238MiB / 7.57GiB"
+                mem_match = re.search(r'([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB)', parts[1])
+                if mem_match:
+                    mem_val = float(mem_match.group(1))
+                    unit = mem_match.group(2)
 
-                # Convert to MB
-                if unit in ("KiB", "KB"):
-                    used_mb = mem_val / 1024.0
-                elif unit in ("GiB", "GB"):
-                    used_mb = mem_val * 1024.0
-                else:
-                    used_mb = mem_val  # MiB or MB
+                    # Convert to MB
+                    if unit in ("KiB", "KB"):
+                        used_mb = mem_val / 1024.0
+                    elif unit in ("GiB", "GB"):
+                        used_mb = mem_val * 1024.0
+                    else:
+                        used_mb = mem_val  # MiB or MB
 
-                stats["memory_mb"] = round(used_mb, 1)
-
-                total_mb = float(stats.get("memory_total_mb") or 0.0)
-                if total_mb > 0:
-                    pct = (used_mb / total_mb) * 100.0
-                    if pct < 0:
-                        pct = 0.0
-                    if pct > 100:
-                        pct = 100.0
-                    stats["memory_percent"] = pct
+                    total_memory_mb += used_mb
+    
+    # Set aggregated CPU and Memory stats
+    if total_cpu_percent < 0:
+        total_cpu_percent = 0
+    stats["cpu_percent"] = round(total_cpu_percent, 1)
+    stats["memory_mb"] = round(total_memory_mb, 1)
+    
+    # Calculate memory percentage
+    total_mb = float(stats.get("memory_total_mb") or 0.0)
+    if total_mb > 0:
+        pct = (total_memory_mb / total_mb) * 100.0
+        if pct < 0:
+            pct = 0.0
+        if pct > 100:
+            pct = 100.0
+        stats["memory_percent"] = round(pct, 1)
+    else:
+        stats["memory_percent"] = 0.0
 
     return stats
 
@@ -502,26 +559,17 @@ def collect_stats():
     # Build conduits list (each conduit instance tracked separately)
     conduits_list = []
     for s in all_stats:
-        if s["conduit_running"]:
-            conduits_list.append({
-                "name": f"{s['alias']}-c1",
-                "vps": s["alias"],
-                "instance": 1,
-                "connections": s["connections"],
-                "connecting": s["connecting"],
-                "up_gb": s["conduit_up_gb"],
-                "down_gb": s["conduit_down_gb"],
-            })
-        if s["conduit2_running"]:
-            conduits_list.append({
-                "name": f"{s['alias']}-c2",
-                "vps": s["alias"],
-                "instance": 2,
-                "connections": s["connections2"],
-                "connecting": s["connecting2"],
-                "up_gb": s["conduit2_up_gb"],
-                "down_gb": s["conduit2_down_gb"],
-            })
+        for conduit in s.get("conduits", []):
+            if conduit["running"]:
+                conduits_list.append({
+                    "name": f"{s['alias']}-c{conduit['instance']}",
+                    "vps": s["alias"],
+                    "instance": conduit["instance"],
+                    "connections": conduit["connections"],
+                    "connecting": conduit["connecting"],
+                    "up_gb": conduit["up_gb"],
+                    "down_gb": conduit["down_gb"],
+                })
 
     with stats_lock:
         current_stats["vps"] = all_stats
@@ -535,19 +583,27 @@ def collect_stats():
     # Add new data point - track all conduit instances separately
     connections_data = {}
     for s in all_stats:
-        connections_data[f"{s['alias']}-c1"] = s["connections"]
-        connections_data[f"{s['alias']}-c2"] = s["connections2"]
+        for conduit in s.get("conduits", []):
+            if conduit["running"]:
+                connections_data[f"{s['alias']}-c{conduit['instance']}"] = conduit["connections"]
 
     history["data"].append({
         "time": full_timestamp,
         "connections": connections_data
     })
-    # Track conduit names (34 instances: 17 VPS x 2 conduits)
-    history["vps_names"] = [f"{s['alias']}-c1" for s in all_stats] + [f"{s['alias']}-c2" for s in all_stats]
+    # Track conduit names (all instances from all VPS)
+    history["vps_names"] = []
+    for s in all_stats:
+        for conduit in s.get("conduits", []):
+            if conduit["running"]:
+                history["vps_names"].append(f"{s['alias']}-c{conduit['instance']}")
 
     save_history(history)
 
-    total_conn = sum((s.get("connections") or 0) + (s.get("connections2") or 0) for s in all_stats)
+    total_conn = sum(
+        sum((c.get("connections") or 0) for c in s.get("conduits", []))
+        for s in all_stats
+    )
 
     total_conduits = len(conduits_list)
     print(
@@ -913,23 +969,30 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const conduits = data.conduits || [];
             const fmtMaybeInt = (x) => (x === null || x === undefined) ? 'N/A' : x;
             const online = vps.filter(v => v.online).length;
-            const totalConn = vps.reduce((a, v) => a + (v.connections || 0) + (v.connections2 || 0), 0);
-            const totalConnecting = vps.reduce((a, v) => a + (v.connecting || 0) + (v.connecting2 || 0), 0);
-            const totalUp = vps.reduce((a, v) => a + (v.conduit_up_gb || 0) + (v.conduit2_up_gb || 0), 0);
-            const totalDown = vps.reduce((a, v) => a + (v.conduit_down_gb || 0) + (v.conduit2_down_gb || 0), 0);
+            
+            // Calculate totals from all conduit instances
+            const totalConn = conduits.reduce((a, c) => a + (c.connections || 0), 0);
+            const totalConnecting = conduits.reduce((a, c) => a + (c.connecting || 0), 0);
+            const totalUp = conduits.reduce((a, c) => a + (c.up_gb || 0), 0);
+            const totalDown = conduits.reduce((a, c) => a + (c.down_gb || 0), 0);
             const avgCpu = vps.length ? (vps.reduce((a, v) => a + v.cpu_percent, 0) / vps.length) : 0;
 
-            // Count services
-            const conduit1Up = vps.filter(v => v.conduit_running).length;
-            const conduit2Up = vps.filter(v => v.conduit2_running).length;
-            const totalConduits = conduit1Up + conduit2Up;
+            // Count services - count all running conduit instances
+            const totalConduits = conduits.length;
+            const conduitCountByVPS = {};
+            vps.forEach(v => {
+                const runningConduits = (v.conduits || []).filter(c => c.running).length;
+                if (runningConduits > 0) {
+                    conduitCountByVPS[v.alias] = runningConduits;
+                }
+            });
             const snowflakeUp = vps.filter(v => v.snowflake_running).length;
             const torbridgeUp = vps.filter(v => v.torbridge_running).length;
             const totalSnowflakeClients = vps.reduce((a, v) => a + (v.snowflake_clients || 0), 0);
 
             document.getElementById('summary').innerHTML = `
                 <div class="summary-card"><div class="summary-icon">🖥️</div><div class="summary-value">${online}/${vps.length}</div><div class="summary-label">VPS Online</div></div>
-                <div class="summary-card"><div class="summary-icon">🚀</div><div class="summary-value" style="color:#00d9ff">${totalConduits}</div><div class="summary-label">Conduits (${conduit1Up}+${conduit2Up})</div></div>
+                <div class="summary-card"><div class="summary-icon">🚀</div><div class="summary-value" style="color:#00d9ff">${totalConduits}</div><div class="summary-label">Conduit Instances</div></div>
                 <div class="summary-card"><div class="summary-icon">❄️</div><div class="summary-value" style="color:#a55eea">${snowflakeUp}</div><div class="summary-label">Snowflake</div></div>
                 <div class="summary-card"><div class="summary-icon">🌉</div><div class="summary-value" style="color:#ff6b6b">${torbridgeUp}</div><div class="summary-label">Tor Bridge</div></div>
                 <div class="summary-card"><div class="summary-icon">🔗</div><div class="summary-value">${totalConn}</div><div class="summary-label">Conduit Users</div></div>
@@ -966,10 +1029,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                     <div class="services-row">
                         <span class="service-badge ${v.conduit_running ? 'running' : 'stopped'}">
-                            <span class="dot"></span>C1
-                        </span>
-                        <span class="service-badge ${v.conduit2_running ? 'running' : 'stopped'}">
-                            <span class="dot"></span>C2
+                            <span class="dot"></span>Conduit${v.conduit_count > 0 ? ' (' + v.conduit_count + ')' : ''}
                         </span>
                         <span class="service-badge ${v.snowflake_running ? 'running' : 'stopped'}">
                             <span class="dot"></span>SF
@@ -979,12 +1039,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         </span>
                     </div>
 
-                    ${v.conduit_running || v.conduit2_running ? `
+                    ${v.conduit_running ? `
                     <div class="service-section">
-                        <div class="service-title">🚀 Conduit Instances</div>
-                        ${v.conduit_running ? `
-                        <div style="margin-bottom:8px;padding:8px;background:rgba(0,217,255,0.1);border-radius:6px;">
-                            <div style="font-size:0.75rem;color:#00d9ff;margin-bottom:4px;">C1 (${v.conduit_uptime})</div>
+                        <div class="service-title">🚀 Conduit (${v.conduit_count || 0} instance${(v.conduit_count || 0) !== 1 ? 's' : ''} aggregated)</div>
+                        <div style="padding:8px;background:rgba(0,217,255,0.1);border-radius:6px;">
+                            <div style="font-size:0.75rem;color:#00d9ff;margin-bottom:4px;">Uptime: ${v.conduit_uptime || 'N/A'}</div>
                             <div class="stat-row">
                                 <span class="stat-label">Connected / Connecting</span>
                                 <span class="stat-value highlight">${fmtMaybeInt(v.connections)} <span style="color:#ffa502;font-size:0.9rem">/ ${fmtMaybeInt(v.connecting)}</span></span>
@@ -994,20 +1053,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                 <span class="stat-value">${v.conduit_up || 'N/A'} / ${v.conduit_down || 'N/A'}</span>
                             </div>
                         </div>
-                        ` : ''}
-                        ${v.conduit2_running ? `
-                        <div style="padding:8px;background:rgba(0,255,136,0.1);border-radius:6px;">
-                            <div style="font-size:0.75rem;color:#00ff88;margin-bottom:4px;">C2 (${v.conduit2_uptime})</div>
-                            <div class="stat-row">
-                                <span class="stat-label">Connected / Connecting</span>
-                                <span class="stat-value highlight">${fmtMaybeInt(v.connections2)} <span style="color:#ffa502;font-size:0.9rem">/ ${fmtMaybeInt(v.connecting2)}</span></span>
-                            </div>
-                            <div class="stat-row">
-                                <span class="stat-label">↑↓ Traffic</span>
-                                <span class="stat-value">${v.conduit2_up || 'N/A'} / ${v.conduit2_down || 'N/A'}</span>
-                            </div>
-                        </div>
-                        ` : ''}
                     </div>
                     ` : ''}
 
