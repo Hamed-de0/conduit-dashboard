@@ -20,7 +20,7 @@ CONFIG_FILE = SCRIPT_DIR / "conduit-vps.conf"
 HISTORY_FILE = SCRIPT_DIR / "conduit-history.json"
 PORT = 5050
 HISTORY_DAYS = 2  # Keep 2 days of history
-REFRESH_INTERVAL = 15  # seconds
+REFRESH_INTERVAL = 10  # seconds
 
 SSH_TIMEOUT = 240  # seconds
 SSH_CONNECT_TIMEOUT = 120 # seconds
@@ -425,11 +425,12 @@ def get_vps_stats(vps):
     # Aggregate all conduit stats for this VPS
     running_conduits = [c for c in stats["conduits"] if c["running"]]
     if running_conduits:
-        # Aggregate connections and traffic
+        # Aggregate connections and traffic from all running conduits
         total_connections = sum((c.get("connections") or 0) for c in running_conduits)
         total_connecting = sum((c.get("connecting") or 0) for c in running_conduits)
-        total_up_gb = sum((c.get("up_gb") or 0) for c in running_conduits)
-        total_down_gb = sum((c.get("down_gb") or 0) for c in running_conduits)
+        # Sum traffic values - up_gb and down_gb are always set (default to 0 if not parsed)
+        total_up_gb = sum(float(c.get("up_gb", 0) or 0) for c in running_conduits)
+        total_down_gb = sum(float(c.get("down_gb", 0) or 0) for c in running_conduits)
         
         # Format aggregated traffic using helper function
         stats["conduit_up"] = format_traffic_gb(total_up_gb)
@@ -552,18 +553,22 @@ def collect_stats():
     full_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
     # Build conduits list (each conduit instance tracked separately)
+    # This list includes all running conduits from all VPS with their individual stats
     conduits_list = []
     for s in all_stats:
         for conduit in s.get("conduits", []):
             if conduit["running"]:
+                # Ensure traffic values are numeric (default to 0 if missing/invalid)
+                up_gb = float(conduit.get("up_gb", 0) or 0)
+                down_gb = float(conduit.get("down_gb", 0) or 0)
                 conduits_list.append({
                     "name": f"{s['alias']}-c{conduit['instance']}",
                     "vps": s["alias"],
                     "instance": conduit["instance"],
-                    "connections": conduit["connections"],
-                    "connecting": conduit["connecting"],
-                    "up_gb": conduit["up_gb"],
-                    "down_gb": conduit["down_gb"],
+                    "connections": conduit.get("connections"),
+                    "connecting": conduit.get("connecting"),
+                    "up_gb": up_gb,
+                    "down_gb": down_gb,
                 })
 
     with stats_lock:
@@ -978,10 +983,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const online = vps.filter(v => v.online).length;
             
             // Calculate totals from all conduit instances
+            // Note: conduits array contains all running conduits from all VPS with their individual stats
             const totalConn = conduits.reduce((a, c) => a + (c.connections || 0), 0);
             const totalConnecting = conduits.reduce((a, c) => a + (c.connecting || 0), 0);
-            const totalUp = conduits.reduce((a, c) => a + (c.up_gb || 0), 0);
-            const totalDown = conduits.reduce((a, c) => a + (c.down_gb || 0), 0);
+            // Sum traffic from all running conduits - up_gb and down_gb are in GB
+            const totalUp = conduits.reduce((a, c) => {
+                const val = parseFloat(c.up_gb) || 0;
+                return a + val;
+            }, 0);
+            const totalDown = conduits.reduce((a, c) => {
+                const val = parseFloat(c.down_gb) || 0;
+                return a + val;
+            }, 0);
             const avgCpu = vps.length ? (vps.reduce((a, v) => a + v.cpu_percent, 0) / vps.length) : 0;
             
             // Format traffic for display
