@@ -229,6 +229,7 @@ def get_vps_stats(vps):
         "conduit_up_gb": 0,
         "conduit_down_gb": 0,
         # Conduit 2 stats
+        "conduit2_name": "",
         "conduit2_running": False,
         "conduit2_uptime": "N/A",
         "connections2": None,
@@ -289,7 +290,8 @@ def get_vps_stats(vps):
             if name == "conduit":
                 stats["conduit_running"] = is_up
                 stats["conduit_uptime"] = uptime_str
-            elif name == "conduit2":
+            elif name == "conduit2" or name == "conduit-2":
+                stats["conduit2_name"] = name
                 stats["conduit2_running"] = is_up
                 stats["conduit2_uptime"] = uptime_str
             elif name == "snowflake":
@@ -345,7 +347,8 @@ def get_vps_stats(vps):
 
     # Get Conduit2 connection count from [STATS] log line
     if stats["conduit2_running"]:
-        stats_line2 = docker_command(vps, "logs --since 10m --tail 100 conduit | grep '\[STATS\]' | tail -1")
+        conduit2_name = stats["conduit2_name"]
+        stats_line2 = docker_command(vps, f"logs --since 10m --tail 100 {conduit2_name} | grep '\[STATS\]' | tail -1")
         if stats_line2:
             connecting_match2 = re.search(r'Connecting:\s*(\d+)', stats_line2)
             if connecting_match2:
